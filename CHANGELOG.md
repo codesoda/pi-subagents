@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Opt-in child-safe nested subagents.** Custom agents can set
+  `allow_subagents: true` to receive scoped `Agent`, `get_subagent_result`, and
+  `steer_subagent` tools. `allowed_subagents` optionally restricts launches to a
+  comma-separated list; omission permits any enabled agent, while `none` permits
+  none. Unknown, disabled, and out-of-list targets fail instead of falling back.
+  Nested controls are ownership-scoped, and an inherited depth cap defaults to
+  main → subagent → nested subagent; `max_subagent_depth` can only tighten it.
+  Nested children retain their own frontmatter, including `persist_session`, so
+  full transcripts can use Pi's normal session store.
+
 ## [0.10.4] - 2026-06-23
 
 ### Fixed

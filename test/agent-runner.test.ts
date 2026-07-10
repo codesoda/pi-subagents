@@ -105,6 +105,15 @@ vi.mock("../src/skill-loader.js", () => ({
   preloadSkills: vi.fn(() => []),
 }));
 
+vi.mock("../src/nested-tools.js", () => ({
+  DEFAULT_MAX_SUBAGENT_DEPTH: 2,
+  createNestedSubagentTools: vi.fn(() => [
+    { name: "Agent" },
+    { name: "get_subagent_result" },
+    { name: "steer_subagent" },
+  ]),
+}));
+
 import {
   extensionCanonicalName,
   getAgentConversation,
@@ -157,6 +166,7 @@ beforeEach(() => {
   settingsManagerGetSessionDir.mockReset();
   settingsManagerGetSessionDir.mockReturnValue(undefined);
   settingsManagerCreate.mockClear();
+  vi.mocked(createNestedSubagentTools).mockClear();
   loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
 });
 
@@ -456,6 +466,7 @@ import {
   getConfig,
   getToolNamesForType,
 } from "../src/agent-types.js";
+import { createNestedSubagentTools } from "../src/nested-tools.js";
 
 const BUILTINS_7 = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
@@ -623,6 +634,70 @@ describe("agent-runner master tool allowlist", () => {
     expect(tools).not.toContain("get_subagent_result");
     expect(tools).not.toContain("steer_subagent");
     expect(tools).toContain("ok_ext");
+  });
+
+  it("allowSubagents omitted/false keeps nested tools unavailable", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: false }));
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", {
+      pi,
+      nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1 },
+    });
+
+    expect(createNestedSubagentTools).not.toHaveBeenCalled();
+    expect(lastToolsPassed()).not.toContain("Agent");
+    expect(createAgentSession.mock.calls[0][0].customTools).toEqual([]);
+  });
+
+  it("allowSubagents true injects child-safe tools even with extensions false", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({ extensions: false, allowSubagents: true, allowedSubagents: ["scout"] }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const manager = {} as any;
+
+    await runAgent(ctx, "Explore", "go", {
+      pi,
+      nestedRuntime: { manager, parentAgentId: "parent", depth: 1, maxSubagentDepth: 2 },
+    });
+
+    expect(createNestedSubagentTools).toHaveBeenCalledWith(expect.objectContaining({
+      manager,
+      parentAgentId: "parent",
+      depth: 1,
+      maxSubagentDepth: 2,
+      allowedSubagents: ["scout"],
+    }));
+    expect(lastToolsPassed()).toEqual(expect.arrayContaining([
+      "Agent", "get_subagent_result", "steer_subagent",
+    ]));
+    expect(createAgentSession.mock.calls[0][0].customTools).toHaveLength(3);
+  });
+
+  it("isolated mode suppresses nested tools even when the agent opts in", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({ extensions: false, allowSubagents: true }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", {
+      pi,
+      isolated: true,
+      nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1 },
+    });
+
+    expect(createNestedSubagentTools).not.toHaveBeenCalled();
+    expect(lastToolsPassed()).not.toContain("Agent");
   });
 
   it("extensions: false with disallowedTools — denylist applies to built-ins", async () => {

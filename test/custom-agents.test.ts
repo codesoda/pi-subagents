@@ -41,6 +41,9 @@ thinking: high
 max_turns: 30
 persist_session: true
 session_dir: .seams/pi-sessions/seam-plan-reviewer
+allow_subagents: true
+allowed_subagents: scout, reviewer
+max_subagent_depth: 2
 prompt_mode: replace
 inherit_context: true
 run_in_background: true
@@ -61,6 +64,9 @@ You are a security auditor.`);
     expect(agent.maxTurns).toBe(30);
     expect(agent.persistSession).toBe(true);
     expect(agent.sessionDir).toBe(".seams/pi-sessions/seam-plan-reviewer");
+    expect(agent.allowSubagents).toBe(true);
+    expect(agent.allowedSubagents).toEqual(["scout", "reviewer"]);
+    expect(agent.maxSubagentDepth).toBe(2);
     expect(agent.promptMode).toBe("replace");
     expect(agent.inheritContext).toBe(true);
     expect(agent.runInBackground).toBe(true);
@@ -87,6 +93,9 @@ Just a prompt.`);
     expect(agent.maxTurns).toBeUndefined();
     expect(agent.persistSession).toBeUndefined();
     expect(agent.sessionDir).toBeUndefined();
+    expect(agent.allowSubagents).toBe(false);
+    expect(agent.allowedSubagents).toBeUndefined();
+    expect(agent.maxSubagentDepth).toBeUndefined();
     expect(agent.promptMode).toBe("replace");
     expect(agent.inheritContext).toBeUndefined();
     expect(agent.runInBackground).toBeUndefined();
@@ -104,6 +113,30 @@ Just a prompt.`);
     expect(agent.description).toBe("bare");
     expect(agent.builtinToolNames).toEqual(BUILTIN_TOOL_NAMES);
     expect(agent.systemPrompt).toBe("Just a system prompt, no frontmatter.");
+  });
+
+  it("distinguishes unrestricted, empty, and omitted nested allowlists", () => {
+    writeAgent("unrestricted", `---
+allow_subagents: true
+---
+Unrestricted.`);
+    writeAgent("empty", `---
+allow_subagents: true
+allowed_subagents: none
+---
+Empty.`);
+    writeAgent("default-off", `---
+allowed_subagents: scout
+---
+Off.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.get("unrestricted")!.allowSubagents).toBe(true);
+    expect(result.get("unrestricted")!.allowedSubagents).toBeUndefined();
+    expect(result.get("empty")!.allowSubagents).toBe(true);
+    expect(result.get("empty")!.allowedSubagents).toEqual([]);
+    expect(result.get("default-off")!.allowSubagents).toBe(false);
+    expect(result.get("default-off")!.allowedSubagents).toEqual(["scout"]);
   });
 
   it("handles tools: none → empty array", () => {

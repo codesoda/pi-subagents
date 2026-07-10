@@ -206,6 +206,9 @@ All fields are optional — sensible defaults for everything.
 | `max_turns` | unlimited | Max agentic turns before graceful shutdown. `0` or omit for unlimited |
 | `persist_session` | `false` | Persist this subagent as a normal pi session instead of keeping the session in memory only. The sidechain output transcript is still written either way |
 | `session_dir` | pi default | Optional session directory when `persist_session: true`; omitted uses pi's normal session location, and relative paths resolve from the agent cwd |
+| `allow_subagents` | `false` | Opt in to child-safe nested `Agent`, `get_subagent_result`, and `steer_subagent` tools |
+| `allowed_subagents` | unrestricted | Optional comma-separated restriction used only when `allow_subagents: true`; omitted allows any enabled agent, while `none` or an explicitly empty value allows none |
+| `max_subagent_depth` | `2` | Optional per-agent cap that can only tighten the inherited nesting limit; the main session is depth 0 and its child is depth 1 |
 | `prompt_mode` | `replace` | `replace`: body is the full system prompt (no AGENTS.md / CLAUDE.md inheritance). `append`: body appended to parent's prompt (agent acts as a "parent twin" — inherits parent's AGENTS.md / CLAUDE.md) |
 | `inherit_context` | `false` | Fork parent conversation into agent |
 | `run_in_background` | `false` | Run in background by default |
@@ -213,6 +216,38 @@ All fields are optional — sensible defaults for everything.
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
 
 Frontmatter is authoritative. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent. `Agent` tool parameters only fill fields the agent config leaves unspecified.
+
+### Nested subagents
+
+Nested delegation is opt-in per agent. Ordinary subagents do not receive this
+extension's orchestration tools. Set `allow_subagents: true` only on an agent that
+owns a real fan-out responsibility:
+
+```yaml
+---
+tools: read, grep, find
+extensions: false
+allow_subagents: true
+allowed_subagents: support-file-finder, support-callsite-tracer
+persist_session: true
+---
+```
+
+`allowed_subagents` is runtime-enforced, not merely prompt guidance. When omitted,
+any enabled/discovered agent type may be launched; `none` means no type may be
+launched. Unknown, disabled, or out-of-list types are rejected instead of falling
+back to `general-purpose`. Nested result and steering operations are
+ownership-scoped, so one parent cannot inspect or control another parent's child.
+
+Nesting has an inherited hard cap of two levels by default: main session →
+subagent → nested subagent. `max_subagent_depth` can tighten that cap for a branch
+but cannot relax an inherited stricter limit. At the cap, `Agent` returns a clear
+error. Agents that do not set `allow_subagents: true` receive no nested tools, so
+leaf agents terminate recursion structurally.
+
+Nested agents use their own frontmatter unchanged. In particular,
+`persist_session: true` with no `session_dir` stores each nested conversation as a
+normal Pi session using Pi's standard session-directory precedence.
 
 ### Tool & extension scoping
 

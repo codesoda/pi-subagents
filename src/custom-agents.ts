@@ -67,6 +67,9 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
       maxTurns: nonNegativeInt(fm.max_turns),
       persistSession: fm.persist_session != null ? fm.persist_session === true : undefined,
       sessionDir: str(fm.session_dir),
+      allowSubagents: fm.allow_subagents === true,
+      allowedSubagents: parseOptionalAllowlist(fm.allowed_subagents),
+      maxSubagentDepth: nonNegativeInt(fm.max_subagent_depth),
       systemPrompt: body.trim(),
       promptMode: fm.prompt_mode === "append" ? "append" : "replace",
       inheritContext: fm.inherit_context != null ? fm.inherit_context === true : undefined,
@@ -102,6 +105,18 @@ function parseCsvField(val: unknown): string[] | undefined {
   if (!s || s === "none") return undefined;
   const items = s.split(",").map(t => t.trim()).filter(Boolean);
   return items.length > 0 ? items : undefined;
+}
+
+/**
+ * Parse an optional restriction list while preserving the distinction between
+ * omitted (unrestricted when allow_subagents is true) and explicitly empty/none
+ * (no nested agent types allowed).
+ */
+function parseOptionalAllowlist(val: unknown): string[] | undefined {
+  if (val === undefined || val === null) return undefined;
+  const s = String(val).trim();
+  if (!s || s === "none") return [];
+  return s.split(",").map(t => t.trim()).filter(Boolean);
 }
 
 /**

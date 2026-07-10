@@ -74,6 +74,35 @@ describe("status note reaches the parent through the real handlers", () => {
     expect(out).not.toContain("STOPPED BY THE USER"); // not mislabelled as a user stop
   });
 
+  it("top-level tools and lifecycle hide records owned by a nested parent", async () => {
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "nested result",
+      session: { dispose: vi.fn() } as any,
+      aborted: false,
+      steered: false,
+    });
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+    const registry = (globalThis as any)[Symbol.for("pi-subagents:manager")];
+
+    const id = registry.spawn(pi, ctx(), "general-purpose", "nested", {
+      description: "nested child",
+      isBackground: true,
+      parentAgentId: "parent-1",
+      depth: 2,
+      maxSubagentDepth: 2,
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(registry.getRecord(id)).toBeUndefined();
+    const result = await tools.get("get_subagent_result").execute(
+      "tc-nested", { agent_id: id }, undefined, undefined, ctx(),
+    );
+    expect(textOf(result)).toContain("Agent not found");
+    expect(pi.events.emit).not.toHaveBeenCalledWith("subagents:started", expect.objectContaining({ id }));
+    expect(pi.events.emit).not.toHaveBeenCalledWith("subagents:completed", expect.objectContaining({ id }));
+  });
+
   it("background user-stop → get_subagent_result flags STOPPED BY THE USER (not completed)", async () => {
     // A background agent that never settles on its own — only a stop ends it.
     vi.mocked(runAgent).mockReturnValue(new Promise(() => {}) as any);

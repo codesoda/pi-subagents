@@ -17,10 +17,12 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
+import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
+import { createNestedSubagentTools, DEFAULT_MAX_SUBAGENT_DEPTH, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
@@ -238,6 +240,13 @@ export interface RunOptions {
    * pre-compaction context size estimate. Aborted compactions don't fire.
    */
   onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
+  /** Runtime bridge for opt-in child-safe nested delegation. */
+  nestedRuntime?: {
+    manager: NestedAgentManager;
+    parentAgentId: string;
+    depth: number;
+    maxSubagentDepth?: number;
+  };
 }
 
 export interface RunResult {
@@ -443,7 +452,7 @@ export async function runAgent(
     systemPromptOverride: () => systemPrompt,
     appendSystemPromptOverride: () => [],
   });
-  await loader.reload();
+  await runInChildSessionContext(() => loader.reload());
 
   // Plain entries in `tools:` are expected to be built-in names (extension tools
   // go through `ext:`), so an unknown name there is unambiguously a typo. Previously
@@ -526,6 +535,23 @@ export async function runAgent(
     ? new Set(agentConfig.disallowedTools)
     : undefined;
 
+  const inheritedMaxDepth = options.nestedRuntime?.maxSubagentDepth ?? DEFAULT_MAX_SUBAGENT_DEPTH;
+  const effectiveMaxDepth = Math.min(
+    inheritedMaxDepth,
+    agentConfig?.maxSubagentDepth ?? inheritedMaxDepth,
+  );
+  const nestedTools = agentConfig?.allowSubagents && options.nestedRuntime && !options.isolated
+    ? createNestedSubagentTools({
+        manager: options.nestedRuntime.manager,
+        pi: options.pi,
+        parentAgentId: options.nestedRuntime.parentAgentId,
+        depth: options.nestedRuntime.depth,
+        maxSubagentDepth: effectiveMaxDepth,
+        allowedSubagents: agentConfig.allowedSubagents,
+      })
+    : [];
+  const nestedToolNames = new Set(nestedTools.map(tool => tool.name));
+
   // Enumerate extension-registered tool names from the loaded resource loader.
   // Extensions populate `extension.tools` during `loader.reload()` and the set
   // is stable afterwards — `bindExtensions` does not register new tools.
@@ -552,9 +578,10 @@ export async function runAgent(
   // set, so listing the exact final set here means the session is correctly
   // scoped from the first instant — no post-construction narrowing required.
   const builtinToolNameSet = new Set(toolNames);
-  const allowedTools = [...toolNames, ...extensionToolNames].filter((t) => {
-    if (EXCLUDED_TOOL_NAMES.includes(t)) return false;
+  const allowedTools = [...toolNames, ...extensionToolNames, ...nestedToolNames].filter((t) => {
     if (disallowedSet?.has(t)) return false;
+    if (nestedToolNames.has(t)) return true;
+    if (EXCLUDED_TOOL_NAMES.includes(t)) return false;
     if (builtinToolNameSet.has(t)) return true;
     // Reached only for extension tools. The extension set was already filtered
     // at the loader (extensionsOverride / noExtensions) and at enumeration
@@ -577,13 +604,14 @@ export async function runAgent(
     modelRegistry: ctx.modelRegistry,
     model,
     tools: allowedTools,
+    customTools: nestedTools,
     resourceLoader: loader,
   };
   if (thinkingLevel) {
     sessionOpts.thinkingLevel = thinkingLevel;
   }
 
-  const { session } = await createAgentSession(sessionOpts);
+  const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
 
   const baseSessionName = agentConfig?.name ?? type;
   session.setSessionName(
