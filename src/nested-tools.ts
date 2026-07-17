@@ -12,6 +12,7 @@ const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent"] as 
 
 interface NestedSpawnOptions {
   description: string;
+  sessionName?: string;
   model?: Model<any>;
   maxTurns?: number;
   isolated?: boolean;
@@ -92,6 +93,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
     parameters: Type.Object({
       prompt: Type.String({ description: "Self-contained task for the nested agent." }),
       description: Type.String({ description: "Short 3-5 word task description." }),
+      name: Type.Optional(Type.String({ description: "Optional human-readable session name. The agent ID suffix is added automatically." })),
       subagent_type: Type.String({ description: `Allowed nested agent type. Available: ${available().join(", ") || "none"}.` }),
       model: Type.Optional(Type.String({ description: "Optional provider/model override." })),
       thinking: Type.Optional(Type.String({ description: "Optional thinking level." })),
@@ -153,6 +155,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       );
       const options: NestedSpawnOptions = {
         description: params.description,
+        sessionName: params.name,
         model,
         maxTurns: invocation.maxTurns,
         isolated: invocation.isolated,

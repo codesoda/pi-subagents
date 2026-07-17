@@ -74,13 +74,19 @@ describe("child-safe nested Agent tool", () => {
     const result = await execute(agent, {
       subagent_type: "reviewer",
       description: "review evidence",
+      name: "CH-005 evidence review",
       prompt: "Review it",
     });
 
     expect(result.isError).toBe(false);
     expect(spawnAndWait).toHaveBeenCalledWith(
       expect.anything(), expect.anything(), "reviewer", "Review it",
-      expect.objectContaining({ depth: 2, parentAgentId: "parent-1", maxSubagentDepth: 2 }),
+      expect.objectContaining({
+        depth: 2,
+        parentAgentId: "parent-1",
+        maxSubagentDepth: 2,
+        sessionName: "CH-005 evidence review",
+      }),
     );
   });
 
