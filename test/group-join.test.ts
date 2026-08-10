@@ -123,6 +123,32 @@ describe("GroupJoinManager", () => {
     expect(deliver.mock.calls[1][1]).toBe(false);
   });
 
+  it("detaches a held completion before its record ID is reused", () => {
+    const deliver = vi.fn();
+    const mgr = new GroupJoinManager(deliver);
+    mgr.registerGroup("g", ["a", "b"]);
+
+    mgr.onAgentComplete(makeRecord("a", { result: "old A" }));
+    expect(mgr.detachAgent("a")).toBe(true);
+    expect(mgr.isGrouped("a")).toBe(false);
+
+    // The remaining member now forms a complete group by itself.
+    mgr.onAgentComplete(makeRecord("b", { result: "B" }));
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(deliver.mock.calls[0][0].map((r: AgentRecord) => r.id)).toEqual(["b"]);
+  });
+
+  it("detaches an incomplete member without claiming a held result", () => {
+    const deliver = vi.fn();
+    const mgr = new GroupJoinManager(deliver);
+    mgr.registerGroup("g", ["a", "b"]);
+
+    expect(mgr.detachAgent("a")).toBe(false);
+    expect(mgr.isGrouped("a")).toBe(false);
+    expect(mgr.isGrouped("b")).toBe(true);
+    expect(deliver).not.toHaveBeenCalled();
+  });
+
   it("returns 'pass' for late completions arriving after a group is already delivered", () => {
     const deliver = vi.fn();
     const mgr = new GroupJoinManager(deliver);

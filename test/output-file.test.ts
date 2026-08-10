@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { encodeCwd, streamToOutputFile, writeInitialEntry } from "../src/output-file.js";
+import { appendPromptEntry, encodeCwd, streamToOutputFile, writeInitialEntry } from "../src/output-file.js";
 
 describe("encodeCwd", () => {
   it("encodes a POSIX absolute path by stripping the leading slash and replacing separators", () => {
@@ -66,6 +66,9 @@ function makeFakeSession(initialMessages: unknown[] = []) {
     },
     push(...msgs: unknown[]) {
       messages.push(...msgs);
+    },
+    replace(...msgs: unknown[]) {
+      messages.splice(0, messages.length, ...msgs);
     },
     fire(event: unknown) {
       cb?.(event);
@@ -149,6 +152,101 @@ describe("streamToOutputFile", () => {
     session.fire({ type: "message_end" });
 
     expect(readEntries()).toHaveLength(1);
+  });
+
+  it("can continue an existing transcript without replaying prior session messages", () => {
+    const session = makeFakeSession([
+      { role: "user", content: "do the thing" },
+      { role: "assistant", content: [{ type: "text", text: "first" }] },
+    ]);
+    const cleanup = streamToOutputFile(session as never, outPath, "agent-1", "/work", session.messages.length);
+
+    session.push(
+      { role: "user", content: "continue" },
+      { role: "assistant", content: [{ type: "text", text: "second" }] },
+    );
+    session.fire({ type: "turn_end" });
+    cleanup();
+
+    const entries = readEntries();
+    expect(entries).toHaveLength(3);
+    expect((entries[1].message as any).content).toBe("continue");
+    expect((entries[2].message as any).content[0].text).toBe("second");
+  });
+
+  it("re-anchors a resumed transcript after pre-prompt compaction", () => {
+    const session = makeFakeSession([
+      { role: "user", content: "old prompt" },
+      { role: "assistant", content: [{ type: "text", text: "old answer" }] },
+    ]);
+    appendPromptEntry(outPath, "agent-1", "continue", "/work");
+    const cleanup = streamToOutputFile(
+      session as never,
+      outPath,
+      "agent-1",
+      "/work",
+      session.messages.length + 1,
+      true,
+      () => true,
+    );
+
+    // Pi may replace the old message array during prompt preflight. It emits
+    // agent_start before installing the resumed user prompt.
+    session.replace({ role: "custom", content: "compaction summary" });
+    session.fire({ type: "agent_start" });
+    session.push(
+      { role: "user", content: "continue" },
+      { role: "assistant", content: [{ type: "text", text: "new answer" }] },
+    );
+    session.fire({ type: "turn_end" });
+    cleanup();
+
+    const entries = readEntries();
+    expect(entries).toHaveLength(3);
+    expect((entries[1].message as any).content).toBe("continue");
+    expect((entries[2].message as any).content[0].text).toBe("new answer");
+  });
+
+  it("keeps overflow-recovery output before reserving the resumed user prompt", () => {
+    const session = makeFakeSession([
+      { role: "user", content: "old" },
+      { role: "assistant", content: [{ type: "text", text: "aborted old answer" }] },
+    ]);
+    let reserve = false;
+    const cleanup = streamToOutputFile(
+      session as never,
+      outPath,
+      "agent-1",
+      "/work",
+      session.messages.length + 1,
+      true,
+      () => {
+        const value = reserve;
+        reserve = false;
+        return value;
+      },
+    );
+
+    session.replace({ role: "custom", content: "compaction summary" });
+    session.fire({ type: "agent_start" });
+    session.push({ role: "assistant", content: [{ type: "text", text: "recovery output" }] });
+    session.fire({ type: "turn_end" });
+
+    appendPromptEntry(outPath, "agent-1", "continue", "/work");
+    reserve = true;
+    session.fire({ type: "agent_start" });
+    session.push(
+      { role: "user", content: "continue" },
+      { role: "assistant", content: [{ type: "text", text: "resumed answer" }] },
+    );
+    session.fire({ type: "turn_end" });
+    cleanup();
+
+    const entries = readEntries();
+    expect(entries).toHaveLength(4);
+    expect((entries[1].message as any).content[0].text).toBe("recovery output");
+    expect((entries[2].message as any).content).toBe("continue");
+    expect((entries[3].message as any).content[0].text).toBe("resumed answer");
   });
 
   it("cleanup() does a final flush and detaches the subscription", () => {

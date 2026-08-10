@@ -278,10 +278,10 @@ function collectResponseText(session: AgentSession) {
 }
 
 /** Get the last assistant text from the completed session history. */
-function getLastAssistantText(session: AgentSession): string {
+function getLastAssistantText(session: AgentSession, excludedMessages?: ReadonlySet<unknown>): string {
   for (let i = session.messages.length - 1; i >= 0; i--) {
     const msg = session.messages[i];
-    if (msg.role !== "assistant") continue;
+    if (excludedMessages?.has(msg) || msg.role !== "assistant") continue;
     const text = extractText(msg.content).trim();
     if (text) return text;
   }
@@ -294,8 +294,9 @@ function getLastAssistantText(session: AgentSession): string {
  */
 function forwardAbortSignal(session: AgentSession, signal?: AbortSignal): () => void {
   if (!signal) return () => {};
-  const onAbort = () => session.abort();
-  signal.addEventListener("abort", onAbort, { once: true });
+  const onAbort = () => { void session.abort(); };
+  if (signal.aborted) onAbort();
+  else signal.addEventListener("abort", onAbort, { once: true });
   return () => signal.removeEventListener("abort", onAbort);
 }
 
@@ -717,18 +718,36 @@ export async function resumeAgent(
   prompt: string,
   options: {
     onToolActivity?: (activity: ToolActivity) => void;
+    onTextDelta?: (delta: string, fullText: string) => void;
+    onTurnEnd?: (turnCount: number) => void;
     onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
   } = {},
 ): Promise<string> {
+  // Snapshot again at the end of prompt preflight: compaction may replace old
+  // messages with cloned objects, so the initial identities alone are not a
+  // safe boundary for this resumed turn's fallback result.
+  let preRunMessages = new Set<unknown>(session.messages);
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
+  let currentMessageText = "";
+  let turnCount = 0;
 
-  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
+  const unsubEvents = (options.signal || options.onToolActivity || options.onTextDelta || options.onTurnEnd || options.onAssistantUsage || options.onCompaction)
     ? session.subscribe((event: AgentSessionEvent) => {
+        // An abort can arrive while prompt() is in extension/compaction
+        // preflight, before the agent has an active run to cancel. Abort again
+        // at agent_start so the resumed model/tool loop cannot escape it.
+        if (event.type === "agent_start" && options.signal?.aborted) void session.abort();
         if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
         if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
+        if (event.type === "message_start") currentMessageText = "";
+        if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+          currentMessageText += event.assistantMessageEvent.delta;
+          options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
+        }
+        if (event.type === "turn_end") options.onTurnEnd?.(++turnCount);
         if (event.type === "message_end" && event.message.role === "assistant") {
           const u = (event.message as any).usage;
           if (u) options.onAssistantUsage?.({
@@ -744,14 +763,22 @@ export async function resumeAgent(
     : () => {};
 
   try {
-    await session.prompt(prompt);
+    await session.prompt(prompt, {
+      preflightResult: (success) => {
+        if (!success) return;
+        preRunMessages = new Set(session.messages);
+        if (options.signal?.aborted) {
+          throw new DOMException("The resumed agent was aborted during prompt preflight.", "AbortError");
+        }
+      },
+    });
   } finally {
     collector.unsubscribe();
     unsubEvents();
     cleanupAbort();
   }
 
-  return collector.getText().trim() || getLastAssistantText(session);
+  return collector.getText().trim() || getLastAssistantText(session, preRunMessages);
 }
 
 /**

@@ -75,9 +75,13 @@ export type JoinMode = 'async' | 'group' | 'smart';
 
 export interface AgentRecord {
   id: string;
+  /** Monotonic run generation; increments each time this record ID is resumed. */
+  runGeneration?: number;
   type: SubagentType;
   description: string;
   status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error";
+  /** False until the current run's promise has settled, including after stop. */
+  runSettled?: boolean;
   result?: string;
   error?: string;
   toolUses: number;

@@ -234,12 +234,59 @@ describe("agent-runner final output capture", () => {
     expect(ctorArgs.appendSystemPromptOverride(["would-be-loaded"])).toEqual([]);
   });
 
-  it("resumeAgent also falls back to the final assistant message text", async () => {
+  it("resumeAgent falls back only to a new final assistant message", async () => {
     const { session } = createSession("RESUMED");
 
     const result = await resumeAgent(session as any, "Continue");
 
     expect(result).toBe("RESUMED");
+  });
+
+  it("resumeAgent does not replay the previous turn when the resumed turn is empty", async () => {
+    const { session } = createSession("unused");
+    session.messages.push({
+      role: "assistant",
+      content: [{ type: "text", text: "OLD RESULT" }],
+    });
+    session.prompt = vi.fn(async () => {});
+
+    const result = await resumeAgent(session as any, "Continue");
+
+    expect(result).toBe("");
+  });
+
+  it("resumeAgent does not replay cloned old messages after pre-prompt compaction", async () => {
+    const { session } = createSession("unused");
+    session.messages.push({
+      role: "assistant",
+      content: [{ type: "text", text: "OLD RESULT" }],
+    });
+    session.prompt = vi.fn(async (_prompt: string, options: any) => {
+      session.messages.splice(0, session.messages.length, {
+        role: "assistant",
+        content: [{ type: "text", text: "OLD RESULT" }],
+      });
+      options.preflightResult(true);
+      session.messages.push({ role: "assistant", content: [] });
+    });
+
+    const result = await resumeAgent(session as any, "Continue");
+
+    expect(result).toBe("");
+  });
+
+  it("resumeAgent refuses to start after an abort during prompt preflight", async () => {
+    const { session } = createSession("unused");
+    const controller = new AbortController();
+    session.prompt = vi.fn(async (_prompt: string, options: any) => {
+      controller.abort();
+      options.preflightResult(true);
+      session.messages.push({ role: "assistant", content: [{ type: "text", text: "SHOULD NOT RUN" }] });
+    });
+
+    await expect(resumeAgent(session as any, "Continue", { signal: controller.signal }))
+      .rejects.toMatchObject({ name: "AbortError" });
+    expect(session.messages).toEqual([]);
   });
 
   it("sets the agent name as session name before binding extensions", async () => {
@@ -354,6 +401,32 @@ describe("agent-runner usage callback wiring", () => {
     await runAgent(ctx, "Explore", "go", { pi, onAssistantUsage: cb });
 
     expect(cb).not.toHaveBeenCalled();
+  });
+
+  it("resumeAgent forwards streaming text and resumed-turn counts", async () => {
+    const { session, listeners } = createSession("RESUMED");
+    const text = vi.fn();
+    const turns = vi.fn();
+
+    session.prompt = vi.fn(async () => {
+      for (const listener of listeners) {
+        listener({ type: "message_start" });
+        listener({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "hello" },
+        });
+        listener({ type: "turn_end" });
+      }
+      session.messages.push({ role: "assistant", content: [{ type: "text", text: "hello" }] });
+    });
+
+    await resumeAgent(session as any, "continue", {
+      onTextDelta: text,
+      onTurnEnd: turns,
+    });
+
+    expect(text).toHaveBeenCalledWith("hello", "hello");
+    expect(turns).toHaveBeenCalledWith(1);
   });
 
   it("resumeAgent forwards usage on message_end the same way", async () => {

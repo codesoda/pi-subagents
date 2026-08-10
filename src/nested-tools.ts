@@ -1,6 +1,7 @@
 import type { Model } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import type { ResumeOptions } from "./agent-manager.js";
 import { getAgentConfig, getAvailableTypes, isValidType, registerAgents, resolveType } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { resolveAgentInvocationConfig } from "./invocation-config.js";
@@ -43,7 +44,7 @@ export interface NestedAgentManager {
     options: Omit<NestedSpawnOptions, "isBackground">,
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
-  resume(id: string, prompt: string, signal?: AbortSignal): Promise<AgentRecord | undefined>;
+  resume(id: string, prompt: string, signal?: AbortSignal, options?: ResumeOptions): Promise<AgentRecord | undefined>;
 }
 
 export interface NestedToolContext {
@@ -110,8 +111,30 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         if (!ownsRecord(existing, context.parentAgentId)) {
           return textResult(`Nested agent not found or not owned by this parent: "${params.resume}".`, true);
         }
-        const resumed = await context.manager.resume(params.resume, params.prompt, signal);
-        return resumed ? textResult(formatRecord(resumed)) : textResult(`Failed to resume nested agent "${params.resume}".`, true);
+        if (existing.status === "running" || existing.status === "queued" || existing.runSettled === false) {
+          const state = existing.runSettled === false && existing.status === "stopped"
+            ? "stopping"
+            : existing.status;
+          return textResult(`Nested agent "${params.resume}" is already ${state}.`, true);
+        }
+        // Frontmatter controls fresh launches; a resume backgrounds only when
+        // this invocation explicitly asks for it.
+        const resumeInBackground = params.run_in_background === true;
+        try {
+          const resumed = await context.manager.resume(
+            params.resume,
+            params.prompt,
+            resumeInBackground ? undefined : signal,
+            { isBackground: resumeInBackground, description: params.description },
+          );
+          if (!resumed) return textResult(`Failed to resume nested agent "${params.resume}".`, true);
+          if (resumeInBackground) {
+            return textResult(`Nested agent resumed in background. Agent ID: ${resumed.id}`);
+          }
+          return textResult(formatRecord(resumed), resumed.status === "error");
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err), true);
+        }
       }
 
       if (context.depth >= context.maxSubagentDepth) {
@@ -222,7 +245,15 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
     }),
     execute: async (_toolCallId, params) => {
       const record = context.manager.getRecord(params.agent_id);
-      if (!ownsRecord(record, context.parentAgentId) || !record.session || record.status !== "running") {
+      if (!ownsRecord(record, context.parentAgentId)) {
+        return textResult(`Nested agent not found or not owned by this parent: "${params.agent_id}".`, true);
+      }
+      if (record.status === "queued") {
+        if (!record.pendingSteers) record.pendingSteers = [];
+        record.pendingSteers.push(params.message);
+        return textResult(`Steering message queued for nested agent ${params.agent_id}.`);
+      }
+      if (!record.session || record.status !== "running") {
         return textResult(`Running nested agent not found or not owned by this parent: "${params.agent_id}".`, true);
       }
       await record.session.steer(params.message);

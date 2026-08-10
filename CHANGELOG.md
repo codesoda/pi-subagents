@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Background session resumes.** `Agent({ resume: id, run_in_background: true })`
+  now returns the existing agent ID immediately, participates in the background
+  concurrency queue, remains steerable/stoppable, and delivers its resumed
+  result through the normal completion notification. Resumes stay foreground
+  unless that invocation explicitly passes the flag, even for an agent whose
+  frontmatter backgrounds fresh launches by default. Resumed turns continue the existing
+  output transcript without replaying prior session messages, and nested agents
+  receive the same ownership-scoped behavior.
 - **Opt-in child-safe nested subagents.** Custom agents can set
   `allow_subagents: true` to receive scoped `Agent`, `get_subagent_result`, and
   `steer_subagent` tools. `allowed_subagents` optionally restricts launches to a

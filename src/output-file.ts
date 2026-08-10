@@ -42,8 +42,8 @@ export function createOutputFilePath(cwd: string, agentId: string, sessionId: st
 }
 
 /** Write the initial user prompt entry. */
-export function writeInitialEntry(path: string, agentId: string, prompt: string, cwd: string): void {
-  const entry = {
+function promptEntry(agentId: string, prompt: string, cwd: string) {
+  return {
     isSidechain: true,
     agentId,
     type: "user",
@@ -51,7 +51,15 @@ export function writeInitialEntry(path: string, agentId: string, prompt: string,
     timestamp: new Date().toISOString(),
     cwd,
   };
-  writeFileSync(path, JSON.stringify(entry) + "\n", "utf-8");
+}
+
+export function writeInitialEntry(path: string, agentId: string, prompt: string, cwd: string): void {
+  writeFileSync(path, JSON.stringify(promptEntry(agentId, prompt, cwd)) + "\n", "utf-8");
+}
+
+/** Append the user prompt that starts a resumed turn. */
+export function appendPromptEntry(path: string, agentId: string, prompt: string, cwd: string): void {
+  appendFileSync(path, JSON.stringify(promptEntry(agentId, prompt, cwd)) + "\n", "utf-8");
 }
 
 /**
@@ -63,8 +71,13 @@ export function streamToOutputFile(
   path: string,
   agentId: string,
   cwd: string,
+  initialWrittenCount = 1,
+  resetOnAgentStart = false,
+  reserveUserPrompt?: () => boolean,
 ): () => void {
-  let writtenCount = 1; // initial user prompt already written
+  // Fresh runs have one manually-written user prompt. Resumes pass the current
+  // session message count so only the newly appended turn is streamed.
+  let writtenCount = initialWrittenCount;
 
   const flush = () => {
     const messages = session.messages;
@@ -86,6 +99,14 @@ export function streamToOutputFile(
   };
 
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+    // A resume may compact before execution begins, replacing the message array
+    // and invalidating its old numeric offset. Overflow recovery itself can
+    // emit agent_start before the resumed prompt is ready; re-anchor there
+    // without skipping a message. Once the prompt is manually persisted, the
+    // callback reserves exactly its one future session slot.
+    if (resetOnAgentStart && event.type === "agent_start") {
+      writtenCount = session.messages.length + (reserveUserPrompt?.() ? 1 : 0);
+    }
     if (event.type === "turn_end") flush();
   });
 

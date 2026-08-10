@@ -54,6 +54,32 @@ interface SpawnArgs {
   options: SpawnOptions;
 }
 
+interface QueueEntry {
+  id: string;
+  start: () => void;
+  /** Settle any deferred queue-facing promise when the entry never starts. */
+  cancel?: () => void;
+}
+
+export interface ResumeOptions {
+  /** Run detached, returning the running/queued record immediately. */
+  isBackground?: boolean;
+  /** Description for this resumed turn. */
+  description?: string;
+  /** Called on tool start/end with activity info. */
+  onToolActivity?: (activity: ToolActivity) => void;
+  /** Called when queued guidance has been folded into the effective prompt. */
+  onPromptPrepared?: (effectivePrompt: string) => void;
+  /** Called on streaming text deltas from the assistant response. */
+  onTextDelta?: (delta: string, fullText: string) => void;
+  /** Called at the end of each resumed agentic turn. */
+  onTurnEnd?: (turnCount: number) => void;
+  /** Called once per assistant message_end with that message's usage delta. */
+  onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+  /** Called when the session successfully compacts. */
+  onCompaction?: (info: CompactionInfo) => void;
+}
+
 export interface SpawnOptions {
   description: string;
   /** Caller-supplied session name; falls back to the agent config/type when omitted. */
@@ -116,8 +142,8 @@ export class AgentManager {
    *  not just the parent repo (caller-supplied cwd can target other repos). */
   private worktreeRepos = new Set<string>();
 
-  /** Queue of background agents waiting to start. */
-  private queue: { id: string; args: SpawnArgs }[] = [];
+  /** Queue of background spawns/resumes waiting to start. */
+  private queue: QueueEntry[] = [];
   /** Number of currently running background agents. */
   private runningBackground = 0;
 
@@ -167,9 +193,11 @@ export class AgentManager {
     const abortController = new AbortController();
     const record: AgentRecord = {
       id,
+      runGeneration: 0,
       type,
       description: options.description,
       status: options.isBackground ? "queued" : "running",
+      runSettled: false,
       toolUses: 0,
       startedAt: Date.now(),
       abortController,
@@ -186,7 +214,7 @@ export class AgentManager {
 
     if (options.isBackground && !options.bypassQueue && this.runningBackground >= this.maxConcurrent) {
       // Queue it — will be started when a running agent completes
-      this.queue.push({ id, args });
+      this.queue.push({ id, start: () => this.startAgent(id, record, args) });
       return id;
     }
 
@@ -236,6 +264,7 @@ export class AgentManager {
     }
 
     record.status = "running";
+    record.runSettled = false;
     record.startedAt = Date.now();
     if (options.isBackground) this.runningBackground++;
     this.onStart?.(record);
@@ -329,6 +358,8 @@ export class AgentManager {
           }
         }
 
+        record.runSettled = true;
+
         // Fire onComplete for foreground agents too — lifecycle symmetry.
         // Mark resultConsumed so the callback skips notifications (result returned inline).
         if (!options.isBackground) {
@@ -365,6 +396,8 @@ export class AgentManager {
           } catch { /* ignore cleanup errors */ }
         }
 
+        record.runSettled = true;
+
         // Fire onComplete for foreground agents too — lifecycle symmetry.
         // Mark resultConsumed so the callback skips notifications (result returned inline).
         if (!options.isBackground) {
@@ -393,13 +426,15 @@ export class AgentManager {
       const record = this.agents.get(next.id);
       if (!record || record.status !== "queued") continue;
       try {
-        this.startAgent(next.id, record, next.args);
+        next.start();
       } catch (err) {
         // Late failure (e.g. strict worktree-isolation) — surface on the record
         // so the user/agent can see it via /agents, then keep draining.
         record.status = "error";
+        record.runSettled = true;
         record.error = err instanceof Error ? err.message : String(err);
         record.completedAt = Date.now();
+        next.cancel?.();
         this.onComplete?.(record);
       }
     }
@@ -447,45 +482,142 @@ export class AgentManager {
 
   /**
    * Resume an existing agent session with a new prompt.
+   *
+   * Foreground resumes preserve the historical await-and-return behavior.
+   * Background resumes return the running/queued record immediately and settle
+   * through the same lifecycle, notification, and concurrency paths as a
+   * background spawn.
    */
   async resume(
     id: string,
     prompt: string,
     signal?: AbortSignal,
+    options: ResumeOptions = {},
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
+    if (record.status === "running" || record.status === "queued" || record.runSettled === false) {
+      const state = record.runSettled === false && record.status === "stopped"
+        ? "stopping"
+        : record.status;
+      throw new Error(`Agent "${id}" is already ${state}; it cannot be resumed concurrently.`);
+    }
 
-    record.status = "running";
+    const isBackground = options.isBackground === true;
+    record.runGeneration = (record.runGeneration ?? 0) + 1;
+    record.description = options.description ?? record.description;
+    record.status = isBackground ? "queued" : "running";
+    record.runSettled = false;
     record.startedAt = Date.now();
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
+    record.resultConsumed = !isBackground;
+    record.abortController = new AbortController();
 
-    try {
-      const responseText = await resumeAgent(record.session, prompt, {
-        onToolActivity: (activity) => {
-          if (activity.type === "end") record.toolUses++;
+    const start = () => this.startResume(id, record, prompt, isBackground ? undefined : signal, options);
+    if (isBackground && this.runningBackground >= this.maxConcurrent) {
+      let settleQueued!: (value: string) => void;
+      const queuedPromise = new Promise<string>((resolve) => { settleQueued = resolve; });
+      record.promise = queuedPromise;
+      this.queue.push({
+        id,
+        start: () => {
+          start();
+          const activePromise = record.promise;
+          if (activePromise === queuedPromise) settleQueued("");
+          else activePromise?.then(settleQueued, () => settleQueued(""));
         },
-        onAssistantUsage: (usage) => {
-          addUsage(record.lifetimeUsage, usage);
-        },
-        onCompaction: (info) => {
-          record.compactionCount++;
-          this.onCompact?.(record, info);
-        },
-        signal,
+        cancel: () => settleQueued(""),
       });
-      record.status = "completed";
-      record.result = responseText;
-      record.completedAt = Date.now();
-    } catch (err) {
-      record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
-      record.completedAt = Date.now();
+      return record;
     }
 
+    start();
+    if (!isBackground) await record.promise;
     return record;
+  }
+
+  /** Start an immediate or queued resume against the existing AgentSession. */
+  private startResume(
+    id: string,
+    record: AgentRecord,
+    prompt: string,
+    parentSignal: AbortSignal | undefined,
+    options: ResumeOptions,
+  ): void {
+    const session = record.session;
+    if (!session) throw new Error(`Agent "${id}" has no active session to resume.`);
+
+    const isBackground = options.isBackground === true;
+    record.status = "running";
+    record.startedAt = Date.now();
+    if (isBackground) this.runningBackground++;
+    this.onStart?.(record);
+
+    let detachParentSignal: (() => void) | undefined;
+    if (parentSignal) {
+      const onParentAbort = () => this.abort(id);
+      if (parentSignal.aborted) onParentAbort();
+      else {
+        parentSignal.addEventListener("abort", onParentAbort, { once: true });
+        detachParentSignal = () => parentSignal.removeEventListener("abort", onParentAbort);
+      }
+    }
+
+    const settle = () => {
+      detachParentSignal?.();
+      detachParentSignal = undefined;
+      if (record.outputCleanup) {
+        try { record.outputCleanup(); } catch { /* ignore */ }
+        record.outputCleanup = undefined;
+      }
+      if (isBackground) this.runningBackground--;
+      try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+      if (isBackground) this.drainQueue();
+    };
+
+    const queuedGuidance = record.pendingSteers;
+    record.pendingSteers = undefined;
+    const effectivePrompt = queuedGuidance?.length
+      ? `${prompt}\n\nAdditional guidance queued while this resumed run was waiting:\n${queuedGuidance.map(message => `- ${message}`).join("\n")}`
+      : prompt;
+    try { options.onPromptPrepared?.(effectivePrompt); } catch { /* transcript/setup callbacks are non-fatal */ }
+
+    record.promise = resumeAgent(session, effectivePrompt, {
+      onToolActivity: (activity) => {
+        if (activity.type === "end") record.toolUses++;
+        options.onToolActivity?.(activity);
+      },
+      onTextDelta: options.onTextDelta,
+      onTurnEnd: options.onTurnEnd,
+      onAssistantUsage: (usage) => {
+        addUsage(record.lifetimeUsage, usage);
+        options.onAssistantUsage?.(usage);
+      },
+      onCompaction: (info) => {
+        record.compactionCount++;
+        this.onCompact?.(record, info);
+        options.onCompaction?.(info);
+      },
+      signal: record.abortController?.signal,
+    })
+      .then((responseText) => {
+        if (record.status !== "stopped") record.status = "completed";
+        record.result = responseText;
+        record.completedAt ??= Date.now();
+        record.runSettled = true;
+        settle();
+        return responseText;
+      })
+      .catch((err) => {
+        if (record.status !== "stopped") record.status = "error";
+        record.error = err instanceof Error ? err.message : String(err);
+        record.completedAt ??= Date.now();
+        record.runSettled = true;
+        settle();
+        return "";
+      });
   }
 
   getRecord(id: string): AgentRecord | undefined {
@@ -504,8 +636,15 @@ export class AgentManager {
 
     // Remove from queue if queued
     if (record.status === "queued") {
+      const queued = this.queue.filter(q => q.id === id);
       this.queue = this.queue.filter(q => q.id !== id);
+      for (const entry of queued) entry.cancel?.();
+      if (record.outputCleanup) {
+        try { record.outputCleanup(); } catch { /* ignore */ }
+        record.outputCleanup = undefined;
+      }
       record.status = "stopped";
+      record.runSettled = true;
       record.completedAt = Date.now();
       return true;
     }
@@ -527,7 +666,7 @@ export class AgentManager {
   private cleanup() {
     const cutoff = Date.now() - 10 * 60_000;
     for (const [id, record] of this.agents) {
-      if (record.status === "running" || record.status === "queued") continue;
+      if (record.status === "running" || record.status === "queued" || record.runSettled === false) continue;
       if ((record.completedAt ?? 0) >= cutoff) continue;
       this.removeRecord(id, record);
     }
@@ -541,7 +680,7 @@ export class AgentManager {
    */
   clearCompleted(skipUnconsumed = false): void {
     for (const [id, record] of this.agents) {
-      if (record.status === "running" || record.status === "queued") continue;
+      if (record.status === "running" || record.status === "queued" || record.runSettled === false) continue;
       if (skipUnconsumed && !record.resultConsumed) continue;
       this.removeRecord(id, record);
     }
@@ -550,7 +689,7 @@ export class AgentManager {
   /** Whether any agents are still running or queued. */
   hasRunning(): boolean {
     return [...this.agents.values()].some(
-      r => r.status === "running" || r.status === "queued",
+      r => r.status === "running" || r.status === "queued" || r.runSettled === false,
     );
   }
 
@@ -560,8 +699,10 @@ export class AgentManager {
     // Clear queued agents first
     for (const queued of this.queue) {
       const record = this.agents.get(queued.id);
+      queued.cancel?.();
       if (record) {
         record.status = "stopped";
+        record.runSettled = true;
         record.completedAt = Date.now();
         count++;
       }
@@ -586,7 +727,7 @@ export class AgentManager {
     while (true) {
       this.drainQueue();
       const pending = [...this.agents.values()]
-        .filter(r => r.status === "running" || r.status === "queued")
+        .filter(r => r.status === "running" || r.status === "queued" || r.runSettled === false)
         .map(r => r.promise)
         .filter(Boolean);
       if (pending.length === 0) break;

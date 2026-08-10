@@ -18,7 +18,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Conversation viewer** — select any agent in `/agents` to open a live-scrolling overlay of its full conversation (auto-follows new content, scroll up to pause). Stop a still-running agent from here by pressing `x` (then `x` again to confirm) — works for background agents too
 - **Custom agent types** — define agents in `.pi/agents/<name>.md` with YAML frontmatter: custom system prompts, model selection, thinking levels, tool restrictions
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
-- **Session resume** — pick up where an agent left off, preserving full conversation context
+- **Session resume** — pick up where an agent left off, preserving full conversation context. Resumes run in the foreground by default; pass `run_in_background: true` to return the same agent ID immediately and receive the resumed result through the normal background completion notification.
 - **Graceful turn limits** — agents get a "wrap up" warning before hard abort, producing clean partial results instead of cut-off output
 - **Case-insensitive agent types** — `"explore"`, `"Explore"`, `"EXPLORE"` all work. Unknown types fall back to general-purpose with a note
 - **Fuzzy model selection** — specify models by name (`"haiku"`, `"sonnet"`) instead of full IDs, with automatic filtering to only available/configured models
@@ -211,11 +211,11 @@ All fields are optional — sensible defaults for everything.
 | `max_subagent_depth` | `2` | Optional per-agent cap that can only tighten the inherited nesting limit; the main session is depth 0 and its child is depth 1 |
 | `prompt_mode` | `replace` | `replace`: body is the full system prompt (no AGENTS.md / CLAUDE.md inheritance). `append`: body appended to parent's prompt (agent acts as a "parent twin" — inherits parent's AGENTS.md / CLAUDE.md) |
 | `inherit_context` | `false` | Fork parent conversation into agent |
-| `run_in_background` | `false` | Run in background by default |
+| `run_in_background` | `false` | Run fresh launches in background by default |
 | `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
 
-Frontmatter is authoritative. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent. `Agent` tool parameters only fill fields the agent config leaves unspecified.
+Frontmatter is authoritative for fresh launches. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that launch; `Agent` tool parameters only fill fields the agent config leaves unspecified. A resume keeps the existing session configuration and runs in the foreground unless that resume call explicitly passes `run_in_background: true`.
 
 ### Nested subagents
 
@@ -298,7 +298,7 @@ Launch a sub-agent.
 | `model` | string | no | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`) |
 | `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh |
 | `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
-| `run_in_background` | boolean | no | Run without blocking |
+| `run_in_background` | boolean | no | Run a fresh launch or resume without blocking |
 | `resume` | string | no | Agent ID to resume a previous session |
 | `isolated` | boolean | no | No extension/MCP tools |
 | `isolation` | `"worktree"` | no | Run in an isolated git worktree |

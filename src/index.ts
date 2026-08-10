@@ -25,7 +25,7 @@ import { isModelInScope, readEnabledModels, resolveEnabledModels } from "./enabl
 import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
-import { createOutputFilePath, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { appendPromptEntry, createOutputFilePath, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
@@ -270,7 +270,20 @@ export default function (pi: ExtensionAPI) {
   // Holds notifications briefly so get_subagent_result can cancel them
   // before they reach pi.sendMessage (fire-and-forget).
   const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
+  const consumedRuns = new Set<string>();
   const NUDGE_HOLD_MS = 200;
+
+  const runKey = (record: AgentRecord) => `${record.id}:${record.runGeneration ?? 0}`;
+  const snapshotRecord = (record: AgentRecord): AgentRecord => ({
+    ...record,
+    lifetimeUsage: { ...record.lifetimeUsage },
+  });
+  const isRunConsumed = (record: AgentRecord) =>
+    record.resultConsumed === true || consumedRuns.has(runKey(record));
+  const markRunConsumed = (record: AgentRecord) => {
+    record.resultConsumed = true;
+    consumedRuns.add(runKey(record));
+  };
 
   function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
     cancelNudge(key);
@@ -290,7 +303,7 @@ export default function (pi: ExtensionAPI) {
 
   // ---- Individual nudge helper (async join mode) ----
   function emitIndividualNudge(record: AgentRecord) {
-    if (record.resultConsumed) return;  // re-check at send time
+    if (isRunConsumed(record)) return;  // re-check this exact run at send time
 
     const notification = formatTaskNotification(record, 500);
     const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
@@ -304,21 +317,24 @@ export default function (pi: ExtensionAPI) {
   }
 
   function sendIndividualNudge(record: AgentRecord) {
+    const snapshot = snapshotRecord(record);
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
-    scheduleNudge(record.id, () => emitIndividualNudge(record));
+    scheduleNudge(record.id, () => emitIndividualNudge(snapshot));
     widget.update();
   }
 
   // ---- Group join manager ----
   const groupJoin = new GroupJoinManager(
     (records, partial) => {
-      for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); }
+      const snapshots = records.map(snapshotRecord);
+      for (const r of snapshots) { agentActivity.delete(r.id); widget.markFinished(r.id); }
 
-      const groupKey = `group:${records.map(r => r.id).join(",")}`;
+      const groupKey = `group:${snapshots.map(runKey).join(",")}`;
       scheduleNudge(groupKey, () => {
-        // Re-check at send time
-        const unconsumed = records.filter(r => !r.resultConsumed);
+        // Re-check each exact run at send time; live AgentRecord IDs may already
+        // have been reused by a resume.
+        const unconsumed = snapshots.filter(r => !isRunConsumed(r));
         if (unconsumed.length === 0) { widget.update(); return; }
 
         const notifications = unconsumed.map(r => formatTaskNotification(r, 300)).join('\n\n');
@@ -402,7 +418,11 @@ export default function (pi: ExtensionAPI) {
 
     // If this agent is pending batch finalization (debounce window still open),
     // don't send an individual nudge — finalizeBatch will pick it up retroactively.
-    if (currentBatchAgents.some(a => a.id === record.id)) {
+    const pendingBatch = currentBatchAgents.find(
+      agent => agent.id === record.id && agent.runGeneration === (record.runGeneration ?? 0),
+    );
+    if (pendingBatch) {
+      pendingBatch.completedRecord = snapshotRecord(record);
       widget.update();
       return;
     }
@@ -564,7 +584,12 @@ export default function (pi: ExtensionAPI) {
   // Uses a debounced timer: each new agent resets the 100ms window so that all
   // parallel tool calls (which may be dispatched across multiple microtasks by the
   // framework) are captured in the same batch.
-  let currentBatchAgents: { id: string; joinMode: JoinMode }[] = [];
+  let currentBatchAgents: {
+    id: string;
+    joinMode: JoinMode;
+    runGeneration: number;
+    completedRecord?: AgentRecord;
+  }[] = [];
   let batchFinalizeTimer: ReturnType<typeof setTimeout> | undefined;
   let batchCounter = 0;
 
@@ -582,20 +607,24 @@ export default function (pi: ExtensionAPI) {
       // Retroactively process agents that already completed during the debounce window.
       // Their onComplete fired but was deferred (agent was in currentBatchAgents),
       // so we feed them into the group now.
-      for (const id of ids) {
-        const record = manager.getRecord(id);
+      for (const batchAgent of smartAgents) {
+        const live = manager.getRecord(batchAgent.id);
+        const record = batchAgent.completedRecord
+          ?? (live?.runGeneration === batchAgent.runGeneration ? live : undefined);
         if (!record) continue;
-        record.groupId = groupId;
-        if (record.completedAt != null && !record.resultConsumed) {
+        if (live?.runGeneration === batchAgent.runGeneration) live.groupId = groupId;
+        if (record.completedAt != null && !isRunConsumed(record)) {
           groupJoin.onAgentComplete(record);
         }
       }
     } else {
       // No group formed — send individual nudges for any agents that completed
       // during the debounce window and had their notification deferred.
-      for (const { id } of batchAgents) {
-        const record = manager.getRecord(id);
-        if (record?.completedAt != null && !record.resultConsumed) {
+      for (const batchAgent of batchAgents) {
+        const live = manager.getRecord(batchAgent.id);
+        const record = batchAgent.completedRecord
+          ?? (live?.runGeneration === batchAgent.runGeneration ? live : undefined);
+        if (record?.completedAt != null && !isRunConsumed(record)) {
           sendIndividualNudge(record);
         }
       }
@@ -847,7 +876,7 @@ Terse command-style prompts produce shallow, generic work.
       ),
       resume: Type.Optional(
         Type.String({
-          description: "Optional agent ID to resume from. Continues from previous context.",
+          description: "Optional agent ID to resume from. Continues from previous context. Combine with run_in_background to resume without blocking and receive a completion notification.",
         }),
       ),
       isolated: Type.Optional(
@@ -1106,13 +1135,154 @@ Terse command-style prompts produce shallow, generic work.
         if (!existing.session) {
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
         }
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        if (existing.status === "running" || existing.status === "queued" || existing.runSettled === false) {
+          const state = existing.runSettled === false && existing.status === "stopped"
+            ? "stopping"
+            : existing.status;
+          return textResult(`Agent "${params.resume}" is already ${state}; it cannot be resumed concurrently.`);
+        }
+
+        // Frontmatter controls fresh-launch strategy. Resume remains foreground
+        // unless this invocation explicitly requests background.
+        const resumeInBackground = params.run_in_background === true;
+        const resumeInvocation = { ...agentInvocation, runInBackground: resumeInBackground };
+        const { tags: resumeInvocationTags } = buildInvocationTags(resumeInvocation);
+        const resumeTags = modeLabel ? [modeLabel, ...resumeInvocationTags] : resumeInvocationTags;
+        const resumeDetailBase = {
+          ...detailBase,
+          tags: resumeTags.length > 0 ? resumeTags : undefined,
+        };
+        existing.invocation = resumeInvocation;
+
+        // A fast resume can reuse the record ID while its prior completion is
+        // still inside the 200ms nudge hold or a join group. Preserve that old
+        // result before manager.resume() clears the record for the new turn.
+        const priorSnapshot = snapshotRecord(existing);
+        const heldBatchRuns = currentBatchAgents.filter(
+          agent => agent.id === existing.id
+            && agent.runGeneration === (existing.runGeneration ?? 0)
+            && agent.completedRecord,
+        );
+        currentBatchAgents = currentBatchAgents.filter(
+          agent => agent.id !== existing.id || agent.runGeneration !== (existing.runGeneration ?? 0),
+        );
+        for (const held of heldBatchRuns) emitIndividualNudge(held.completedRecord!);
+
+        const hadPendingNudge = pendingNudges.has(existing.id);
+        cancelNudge(existing.id);
+        const hadHeldGroupResult = groupJoin.detachAgent(existing.id);
+        if ((hadPendingNudge || hadHeldGroupResult) && !priorSnapshot.resultConsumed) {
+          emitIndividualNudge(priorSnapshot);
+        }
+        existing.groupId = undefined;
+
+        // The session already exists, so no onSessionCreated callback will fire.
+        // Continue the same transcript from the current message count rather
+        // than replaying the whole conversation into the output file.
+        const priorMessageCount = existing.session.messages.length;
+        let transcriptInitialized = existing.outputFile != null;
+        let reserveNextUserPrompt = false;
+        if (!existing.outputFile) {
+          existing.outputFile = createOutputFilePath(ctx.cwd, existing.id, ctx.sessionManager.getSessionId());
+        }
+        const writeResumePrompt = (effectivePrompt: string) => {
+          if (transcriptInitialized) {
+            appendPromptEntry(existing.outputFile!, existing.id, effectivePrompt, ctx.cwd);
+          } else {
+            writeInitialEntry(existing.outputFile!, existing.id, effectivePrompt, ctx.cwd);
+            transcriptInitialized = true;
+          }
+          reserveNextUserPrompt = true;
+        };
+        existing.outputCleanup = streamToOutputFile(
+          existing.session,
+          existing.outputFile,
+          existing.id,
+          ctx.cwd,
+          priorMessageCount + 1,
+          true,
+          () => {
+            const reserve = reserveNextUserPrompt;
+            reserveNextUserPrompt = false;
+            return reserve;
+          },
+        );
+
+        if (resumeInBackground) {
+          const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(effectiveMaxTurns);
+          bgState.session = existing.session;
+          const joinMode = resolveJoinMode(defaultJoinMode, true);
+          existing.joinMode = joinMode;
+          existing.toolCallId = toolCallId;
+
+          let record: AgentRecord | undefined;
+          try {
+            // Deliberately omit the tool-call signal: like a fresh background
+            // spawn, the resumed run must outlive the Agent tool invocation.
+            record = await manager.resume(params.resume, params.prompt, undefined, {
+              isBackground: true,
+              description: params.description,
+              onPromptPrepared: writeResumePrompt,
+              ...bgCallbacks,
+            });
+          } catch (err) {
+            existing.outputCleanup?.();
+            existing.outputCleanup = undefined;
+            return textResult(err instanceof Error ? err.message : String(err));
+          }
+          if (!record) {
+            existing.outputCleanup?.();
+            existing.outputCleanup = undefined;
+            return textResult(`Failed to resume agent "${params.resume}".`);
+          }
+
+          if (joinMode && joinMode !== 'async') {
+            currentBatchAgents.push({
+              id: record.id,
+              joinMode,
+              runGeneration: record.runGeneration ?? 0,
+            });
+            if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+            batchFinalizeTimer = setTimeout(finalizeBatch, 100);
+          }
+
+          agentActivity.set(record.id, bgState);
+          widget.ensureTimer();
+          widget.update();
+
+          const isQueued = record.status === "queued";
+          return textResult(
+            `Agent ${isQueued ? "queued" : "resumed"} in background.\n` +
+            `Agent ID: ${record.id}\n` +
+            `Type: ${displayName}\n` +
+            `Description: ${params.description}\n` +
+            (record.outputFile ? `Output file: ${record.outputFile}\n` : "") +
+            (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
+            `\nYou will be notified when this agent completes.\n` +
+            `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.`,
+            { ...resumeDetailBase, toolUses: record.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: record.id },
+          );
+        }
+
+        let record: AgentRecord | undefined;
+        try {
+          record = await manager.resume(params.resume, params.prompt, signal, {
+            description: params.description,
+            onPromptPrepared: writeResumePrompt,
+          });
+        } catch (err) {
+          existing.outputCleanup?.();
+          existing.outputCleanup = undefined;
+          return textResult(err instanceof Error ? err.message : String(err));
+        }
         if (!record) {
+          existing.outputCleanup?.();
+          existing.outputCleanup = undefined;
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
         return textResult(
           record.result?.trim() || record.error?.trim() || "No output.",
-          buildDetails(detailBase, record),
+          buildDetails(resumeDetailBase, record),
         );
       }
 
@@ -1166,7 +1336,11 @@ Terse command-style prompts produce shallow, generic work.
           // Foreground/no join mode or explicit async — not part of any batch
         } else {
           // smart or group — add to current batch
-          currentBatchAgents.push({ id, joinMode });
+          currentBatchAgents.push({
+            id,
+            joinMode,
+            runGeneration: record?.runGeneration ?? 0,
+          });
           // Debounce: reset timer on each new agent so parallel tool calls
           // dispatched across multiple event loop ticks are captured together
           if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
@@ -1352,8 +1526,8 @@ Terse command-style prompts produce shallow, generic work.
       // Pre-mark resultConsumed BEFORE awaiting: onComplete fires inside .then()
       // (attached earlier at spawn time) and always runs before this await resumes.
       // Setting the flag here prevents a redundant follow-up notification.
-      if (params.wait && record.status === "running" && record.promise) {
-        record.resultConsumed = true;
+      if (params.wait && (record.status === "running" || record.status === "queued" || record.runSettled === false) && record.promise) {
+        markRunConsumed(record);
         cancelNudge(params.agent_id);
         await record.promise;
       }
@@ -1383,7 +1557,7 @@ Terse command-style prompts produce shallow, generic work.
 
       // Mark result as consumed — suppresses the completion notification
       if (record.status !== "running" && record.status !== "queued") {
-        record.resultConsumed = true;
+        markRunConsumed(record);
         cancelNudge(params.agent_id);
       }
 
@@ -1405,12 +1579,12 @@ Terse command-style prompts produce shallow, generic work.
     name: SUBAGENT_TOOL_NAMES.STEER,
     label: "Steer Agent",
     description:
-      "Send a steering message to a running agent. The message will interrupt the agent after its current tool execution " +
-      "and be injected into its conversation, allowing you to redirect its work mid-run. Only works on running agents.",
+      "Send a steering message to a running agent, or queue guidance for an agent waiting on the background concurrency limit. " +
+      "A running agent processes it after its current tool execution.",
     promptSnippet: "Send a steering message to redirect a running background agent",
     parameters: Type.Object({
       agent_id: Type.String({
-        description: "The agent ID to steer (must be currently running).",
+        description: "The agent ID to steer (running or queued)."
       }),
       message: Type.String({
         description: "The steering message to send. This will appear as a user message in the agent's conversation.",
@@ -1421,22 +1595,22 @@ Terse command-style prompts produce shallow, generic work.
       if (!record || record.parentAgentId) {
         return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
-      if (record.status !== "running") {
-        return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
-      }
-      if (!record.session) {
-        // Session not ready yet — queue the steer for delivery once initialized
+      if (record.status === "queued" || (record.status === "running" && !record.session)) {
         if (!record.pendingSteers) record.pendingSteers = [];
         record.pendingSteers.push(params.message);
         pi.events.emit("subagents:steered", { id: record.id, message: params.message });
-        return textResult(`Steering message queued for agent ${record.id}. It will be delivered once the session initializes.`);
+        return textResult(`Steering message queued for agent ${record.id}. It will be included when the agent starts.`);
       }
+      if (record.status !== "running" || !record.session) {
+        return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
+      }
+      const session = record.session;
 
       try {
-        await steerAgent(record.session, params.message);
+        await steerAgent(session, params.message);
         pi.events.emit("subagents:steered", { id: record.id, message: params.message });
         const tokens = formatLifetimeTokens(record);
-        const contextPercent = getSessionContextPercent(record.session);
+        const contextPercent = getSessionContextPercent(session);
         const stateParts: string[] = [];
         if (tokens) stateParts.push(tokens);
         stateParts.push(`${record.toolUses} tool ${record.toolUses === 1 ? "use" : "uses"}`);

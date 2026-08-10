@@ -126,6 +126,29 @@ export class GroupJoinManager {
     this.groups.delete(groupId);
   }
 
+  /**
+   * Remove an agent before its record ID is reused for a resumed run.
+   * Returns true when a completed result was being held by the group so the
+   * caller can preserve that prior notification before mutating the record.
+   */
+  detachAgent(agentId: string): boolean {
+    const groupId = this.agentToGroup.get(agentId);
+    if (!groupId) return false;
+    const group = this.groups.get(groupId);
+    this.agentToGroup.delete(agentId);
+    if (!group) return false;
+
+    const heldCompletion = group.completedRecords.delete(agentId);
+    group.agentIds.delete(agentId);
+
+    if (group.agentIds.size === 0) {
+      this.cleanupGroup(groupId);
+    } else if (group.completedRecords.size >= group.agentIds.size) {
+      this.deliver(group, false);
+    }
+    return heldCompletion;
+  }
+
   /** Check if an agent is in a group. */
   isGrouped(agentId: string): boolean {
     return this.agentToGroup.has(agentId);

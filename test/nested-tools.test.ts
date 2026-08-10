@@ -11,6 +11,7 @@ let manager: NestedAgentManager;
 let records: Map<string, any>;
 let spawn: ReturnType<typeof vi.fn>;
 let spawnAndWait: ReturnType<typeof vi.fn>;
+let resume: ReturnType<typeof vi.fn>;
 
 function writeAgent(name: string, extra = "") {
   const dir = join(cwd, ".pi", "agents");
@@ -58,11 +59,17 @@ beforeEach(() => {
     records.set(id, record);
     return { id, record };
   });
+  resume = vi.fn(async (id, _prompt, _signal, options) => {
+    const record = records.get(id);
+    record.status = options?.isBackground ? "running" : "completed";
+    record.result = options?.isBackground ? undefined : "resumed";
+    return record;
+  });
   manager = {
     spawn,
     spawnAndWait,
     getRecord: (id: string) => records.get(id),
-    resume: vi.fn(),
+    resume,
   } as any;
 });
 
@@ -156,6 +163,104 @@ describe("child-safe nested Agent tool", () => {
     const foreign = await execute(getResult, { agent_id: "foreign" });
     expect(foreign.isError).toBe(true);
     expect(foreign.content[0].text).toContain("not owned");
+  });
+
+  it("resumes an owned nested agent in the background without awaiting its result", async () => {
+    records.set("child-1", {
+      id: "child-1",
+      type: "scout",
+      status: "completed",
+      result: "first",
+      parentAgentId: "parent-1",
+    });
+    const [agent] = tools(["scout"]);
+    const result = await execute(agent, {
+      subagent_type: "scout",
+      description: "continue search",
+      prompt: "Find more",
+      resume: "child-1",
+      run_in_background: true,
+    });
+
+    expect(result.isError).toBe(false);
+    expect(result.content[0].text).toContain("resumed in background");
+    expect(result.content[0].text).toContain("child-1");
+    expect(resume).toHaveBeenCalledWith(
+      "child-1",
+      "Find more",
+      undefined,
+      expect.objectContaining({ isBackground: true, description: "continue search" }),
+    );
+  });
+
+  it("keeps nested resumes foreground by default", async () => {
+    records.set("child-1", {
+      id: "child-1",
+      type: "scout",
+      status: "completed",
+      parentAgentId: "parent-1",
+    });
+    const [agent] = tools(["scout"]);
+    const result = await execute(agent, {
+      subagent_type: "scout",
+      description: "continue search",
+      prompt: "Find more",
+      resume: "child-1",
+    });
+
+    expect(result.content[0].text).toBe("resumed");
+    expect(resume).toHaveBeenCalledWith(
+      "child-1",
+      "Find more",
+      undefined,
+      expect.objectContaining({ isBackground: false }),
+    );
+  });
+
+  it("does not apply fresh-launch background frontmatter to a resume", async () => {
+    writeAgent("background-default", "run_in_background: true\n");
+    registerAgents(loadCustomAgents(cwd));
+    records.set("child-1", {
+      id: "child-1",
+      type: "background-default",
+      status: "completed",
+      parentAgentId: "parent-1",
+    });
+    const [agent] = tools(["background-default"]);
+    const result = await execute(agent, {
+      subagent_type: "background-default",
+      description: "continue work",
+      prompt: "Continue",
+      resume: "child-1",
+    });
+
+    expect(result.content[0].text).toBe("resumed");
+    expect(resume).toHaveBeenCalledWith(
+      "child-1",
+      "Continue",
+      undefined,
+      expect.objectContaining({ isBackground: false }),
+    );
+  });
+
+  it("queues steering guidance for an owned nested agent waiting to resume", async () => {
+    const record = {
+      id: "child-1",
+      type: "scout",
+      status: "queued",
+      parentAgentId: "parent-1",
+    };
+    records.set("child-1", record);
+    const [, , steer] = tools(["scout"]);
+
+    const result = await execute(steer, {
+      agent_id: "child-1",
+      message: "check the fallback path",
+    });
+
+    expect(result.isError).toBe(false);
+    expect(result.content[0].text).toContain("queued");
+    expect((record as any).pendingSteers).toEqual(["check the fallback path"]);
   });
 
   it("propagates a target agent's tighter depth cap", async () => {
