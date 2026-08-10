@@ -34,6 +34,8 @@ function tools(allowedSubagents?: string[], depth = 1, maxSubagentDepth = 2) {
     parentAgentId: "parent-1",
     depth,
     maxSubagentDepth,
+    rootSessionId: "root-session",
+    rootSessionFile: "/sessions/root.jsonl",
     allowedSubagents,
   });
 }
@@ -93,6 +95,8 @@ describe("child-safe nested Agent tool", () => {
         parentAgentId: "parent-1",
         maxSubagentDepth: 2,
         sessionName: "CH-005 evidence review",
+        lineageRootSessionId: "root-session",
+        lineageRootSessionFile: "/sessions/root.jsonl",
       }),
     );
   });

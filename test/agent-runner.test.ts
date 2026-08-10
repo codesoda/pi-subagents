@@ -8,6 +8,7 @@ const {
   getAgentDir,
   sessionManagerInMemory,
   sessionManagerCreate,
+  persistentSessionManager,
   settingsManagerCreate,
   settingsManagerGetSessionDir,
 } = vi.hoisted(() => ({
@@ -22,7 +23,14 @@ const {
   },
   getAgentDir: vi.fn(() => "/mock/agent-dir"),
   sessionManagerInMemory: vi.fn(() => ({ kind: "memory-session-manager" })),
-  sessionManagerCreate: vi.fn(() => ({ kind: "persistent-session-manager" })),
+  persistentSessionManager: {
+    kind: "persistent-session-manager",
+    newSession: vi.fn(),
+    getSessionId: vi.fn(() => "child-session"),
+    getSessionFile: vi.fn(() => "/sessions/child.jsonl"),
+    appendCustomEntry: vi.fn(),
+  },
+  sessionManagerCreate: vi.fn(),
   settingsManagerGetSessionDir: vi.fn(() => undefined as string | undefined),
   settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir })),
 }));
@@ -143,6 +151,7 @@ function createSession(finalText: string) {
     setActiveToolsByName: vi.fn(),
     setSessionName: vi.fn(),
     bindExtensions: vi.fn(async () => {}),
+    sessionManager: persistentSessionManager,
   };
   return { session, listeners };
 }
@@ -162,7 +171,12 @@ beforeEach(() => {
   defaultResourceLoaderCtor.mockClear();
   getAgentDir.mockClear();
   sessionManagerInMemory.mockClear();
-  sessionManagerCreate.mockClear();
+  sessionManagerCreate.mockReset();
+  sessionManagerCreate.mockReturnValue(persistentSessionManager);
+  persistentSessionManager.newSession.mockReset();
+  persistentSessionManager.getSessionId.mockClear();
+  persistentSessionManager.getSessionFile.mockClear();
+  persistentSessionManager.appendCustomEntry.mockReset();
   settingsManagerGetSessionDir.mockReset();
   settingsManagerGetSessionDir.mockReturnValue(undefined);
   settingsManagerCreate.mockClear();
@@ -643,8 +657,50 @@ describe("agent-runner session persistence", () => {
     expect(sessionManagerInMemory).not.toHaveBeenCalled();
     expect(sessionManagerCreate).toHaveBeenCalledWith("/tmp", "/normal/pi/sessions");
     expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
-      sessionManager: { kind: "persistent-session-manager" },
+      sessionManager: persistentSessionManager,
     }));
+    expect(persistentSessionManager.newSession).not.toHaveBeenCalled();
+    expect(persistentSessionManager.appendCustomEntry).not.toHaveBeenCalled();
+  });
+
+  it("records the parent header and explicit top-level lineage for a persisted subagent", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: true }));
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", {
+      pi,
+      agentId: "agent-123456789",
+      lineage: {
+        parentSessionId: "parent-session",
+        parentSessionFile: "/sessions/parent.jsonl",
+        rootSessionId: "parent-session",
+        rootSessionFile: "/sessions/parent.jsonl",
+        depth: 1,
+      },
+    });
+
+    expect(persistentSessionManager.newSession).toHaveBeenCalledWith({
+      parentSession: "/sessions/parent.jsonl",
+    });
+    expect(persistentSessionManager.appendCustomEntry).toHaveBeenCalledWith(
+      "pi-subagents.lineage",
+      {
+        schema: "pi-subagents.lineage.v1",
+        role: "subagent",
+        kind: "top_level",
+        depth: 1,
+        session_id: "child-session",
+        session_file: "/sessions/child.jsonl",
+        parent_session_id: "parent-session",
+        parent_session_file: "/sessions/parent.jsonl",
+        root_session_id: "parent-session",
+        root_session_file: "/sessions/parent.jsonl",
+        agent_id: "agent-123456789",
+        agent_type: "Explore",
+        parent_agent_id: null,
+      },
+    );
   });
 
   it("uses a frontmatter sessionDir when persistSession is true and sessionDir is configured", async () => {

@@ -26,6 +26,8 @@ interface NestedSpawnOptions {
   depth: number;
   parentAgentId: string;
   maxSubagentDepth: number;
+  lineageRootSessionId?: string;
+  lineageRootSessionFile?: string;
 }
 
 export interface NestedAgentManager {
@@ -53,6 +55,9 @@ export interface NestedToolContext {
   parentAgentId: string;
   depth: number;
   maxSubagentDepth: number;
+  /** Root of the current subagent branch, propagated to nested children. */
+  rootSessionId?: string;
+  rootSessionFile?: string;
   /** undefined = unrestricted; [] = explicitly allow none. */
   allowedSubagents?: string[];
 }
@@ -196,6 +201,8 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         depth: childDepth,
         parentAgentId: context.parentAgentId,
         maxSubagentDepth: childMaxDepth,
+        lineageRootSessionId: context.rootSessionId,
+        lineageRootSessionFile: context.rootSessionFile,
       };
 
       if (invocation.runInBackground) {

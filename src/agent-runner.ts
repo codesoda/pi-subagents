@@ -24,6 +24,7 @@ import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, DEFAULT_MAX_SUBAGENT_DEPTH, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
+import { appendSubagentLineage, attachParentSession, type SubagentLineageContext } from "./session-lineage.js";
 import { preloadSkills } from "./skill-loader.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
 
@@ -242,6 +243,8 @@ export interface RunOptions {
    * pre-compaction context size estimate. Aborted compactions don't fire.
    */
   onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
+  /** Immutable session ancestry captured by AgentManager at launch time. */
+  lineage?: SubagentLineageContext;
   /** Runtime bridge for opt-in child-safe nested delegation. */
   nestedRuntime?: {
     manager: NestedAgentManager;
@@ -550,6 +553,8 @@ export async function runAgent(
         parentAgentId: options.nestedRuntime.parentAgentId,
         depth: options.nestedRuntime.depth,
         maxSubagentDepth: effectiveMaxDepth,
+        rootSessionId: options.lineage?.rootSessionId,
+        rootSessionFile: options.lineage?.rootSessionFile,
         allowedSubagents: agentConfig.allowedSubagents,
       })
     : [];
@@ -598,6 +603,9 @@ export async function runAgent(
   const sessionManager = agentConfig?.persistSession
     ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir)
     : SessionManager.inMemory(effectiveCwd);
+  if (agentConfig?.persistSession) {
+    attachParentSession(sessionManager, options.lineage?.parentSessionFile);
+  }
 
   const sessionOpts: Parameters<typeof createAgentSession>[0] = {
     cwd: effectiveCwd,
@@ -623,6 +631,9 @@ export async function runAgent(
   session.setSessionName(
     options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName,
   );
+  if (agentConfig?.persistSession && options.agentId && options.lineage) {
+    appendSubagentLineage(session.sessionManager, options.agentId, type, options.lineage);
+  }
 
   // Bind extensions so that session_start fires and extensions can initialize
   // (e.g. loading credentials, setting up state). Tool gating already happened

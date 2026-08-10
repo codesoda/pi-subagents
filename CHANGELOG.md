@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Durable persisted-session lineage.** Persisted subagents now link their Pi
+  session header to the immediate parent file and append a versioned custom
+  entry that explicitly records top-level/nested classification, child,
+  parent/root session identities, agent ID/type, depth, and parent agent ID.
+  The metadata remains outside model context and survives restart/resume.
 - **Background session resumes.** `Agent({ resume: id, run_in_background: true })`
   now returns the existing agent ID immediately, participates in the background
   concurrency queue, remains steerable/stoppable, and delivers its resumed

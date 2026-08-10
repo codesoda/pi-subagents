@@ -12,6 +12,7 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import type { SubagentLineageContext } from "./session-lineage.js";
 import type { AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, pruneWorktrees, } from "./worktree.js";
@@ -52,6 +53,7 @@ interface SpawnArgs {
   type: SubagentType;
   prompt: string;
   options: SpawnOptions;
+  lineage?: SubagentLineageContext;
 }
 
 interface QueueEntry {
@@ -129,6 +131,10 @@ export interface SpawnOptions {
   parentAgentId?: string;
   /** Effective inherited nesting cap for this branch. */
   maxSubagentDepth?: number;
+  /** Internal root-session propagation for nested launches. */
+  lineageRootSessionId?: string;
+  /** Internal root-session path propagation for nested launches. */
+  lineageRootSessionFile?: string;
 }
 
 export class AgentManager {
@@ -210,7 +216,21 @@ export class AgentManager {
     };
     this.agents.set(id, record);
 
-    const args: SpawnArgs = { pi, ctx, type, prompt, options };
+    // Snapshot lineage at invocation time. A queued child must retain the
+    // session identity that launched it rather than reading a later live value.
+    const parentSessionId = ctx.sessionManager?.getSessionId?.();
+    const parentSessionFile = ctx.sessionManager?.getSessionFile?.();
+    const lineage: SubagentLineageContext | undefined = parentSessionId
+      ? {
+          parentSessionId,
+          parentSessionFile,
+          rootSessionId: options.lineageRootSessionId ?? parentSessionId,
+          rootSessionFile: options.lineageRootSessionFile ?? parentSessionFile,
+          parentAgentId: options.parentAgentId,
+          depth: options.depth ?? 1,
+        }
+      : undefined;
+    const args: SpawnArgs = { pi, ctx, type, prompt, options, lineage };
 
     if (options.isBackground && !options.bypassQueue && this.runningBackground >= this.maxConcurrent) {
       // Queue it — will be started when a running agent completes
@@ -230,7 +250,7 @@ export class AgentManager {
   }
 
   /** Actually start an agent (called immediately or from queue drain). */
-  private startAgent(id: string, record: AgentRecord, { pi, ctx, type, prompt, options }: SpawnArgs) {
+  private startAgent(id: string, record: AgentRecord, { pi, ctx, type, prompt, options, lineage }: SpawnArgs) {
     // Re-validate a caller-supplied cwd: queued spawns can start minutes after
     // spawn()'s check, and the directory may be gone by then (TOCTOU). Same
     // curated errors; drainQueue parks a throw on the record as an error.
@@ -295,6 +315,7 @@ export class AgentManager {
       cwd: worktreeCwd ?? customCwd,
       configCwd: customCwd !== undefined ? ctx.cwd : undefined,
       signal: record.abortController!.signal,
+      lineage,
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);

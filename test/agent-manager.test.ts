@@ -113,6 +113,104 @@ describe("AgentManager — Bug 1 race condition (resultConsumed vs onComplete)",
   });
 });
 
+describe("AgentManager — durable session lineage", () => {
+  let manager: AgentManager;
+  afterEach(() => manager?.dispose());
+
+  it("captures immediate parent and propagated root identities at launch", async () => {
+    manager = new AgentManager();
+    resolvedRun();
+    const lineageCtx = {
+      cwd: "/tmp",
+      sessionManager: {
+        getSessionId: () => "immediate-parent",
+        getSessionFile: () => "/sessions/immediate-parent.jsonl",
+      },
+    } as any;
+
+    const id = manager.spawn(mockPi, lineageCtx, "general-purpose", "test", {
+      description: "test lineage",
+      isBackground: true,
+      depth: 2,
+      parentAgentId: "parent-agent",
+      lineageRootSessionId: "root-session",
+      lineageRootSessionFile: "/sessions/root.jsonl",
+    });
+    await manager.getRecord(id)!.promise;
+
+    expect(runAgent).toHaveBeenCalledWith(
+      lineageCtx,
+      "general-purpose",
+      "test",
+      expect.objectContaining({
+        lineage: {
+          parentSessionId: "immediate-parent",
+          parentSessionFile: "/sessions/immediate-parent.jsonl",
+          rootSessionId: "root-session",
+          rootSessionFile: "/sessions/root.jsonl",
+          parentAgentId: "parent-agent",
+          depth: 2,
+        },
+      }),
+    );
+  });
+
+  it("keeps a queued launch bound to its invocation-time parent", async () => {
+    manager = new AgentManager(undefined, 1);
+    let finishFirst!: () => void;
+    vi.mocked(runAgent)
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        finishFirst = () => resolve({
+          responseText: "first done",
+          session: mockSession(),
+          aborted: false,
+          steered: false,
+        });
+      }))
+      .mockResolvedValueOnce({
+        responseText: "second done",
+        session: mockSession(),
+        aborted: false,
+        steered: false,
+      });
+
+    let parentId = "parent-at-launch";
+    let parentFile = "/sessions/parent-at-launch.jsonl";
+    const lineageCtx = {
+      cwd: "/tmp",
+      sessionManager: {
+        getSessionId: () => parentId,
+        getSessionFile: () => parentFile,
+      },
+    } as any;
+    const first = manager.spawn(mockPi, lineageCtx, "general-purpose", "first", {
+      description: "occupy queue",
+      isBackground: true,
+    });
+    const second = manager.spawn(mockPi, lineageCtx, "general-purpose", "second", {
+      description: "queued child",
+      isBackground: true,
+    });
+    expect(manager.getRecord(second)?.status).toBe("queued");
+
+    parentId = "later-parent";
+    parentFile = "/sessions/later-parent.jsonl";
+    finishFirst();
+    await manager.getRecord(first)!.promise;
+    await manager.getRecord(second)!.promise;
+
+    const secondCall = vi.mocked(runAgent).mock.calls.find((call) => call[2] === "second");
+    expect(secondCall?.[3].lineage).toEqual({
+      parentSessionId: "parent-at-launch",
+      parentSessionFile: "/sessions/parent-at-launch.jsonl",
+      rootSessionId: "parent-at-launch",
+      rootSessionFile: "/sessions/parent-at-launch.jsonl",
+      parentAgentId: undefined,
+      depth: 1,
+    });
+  });
+});
+
 describe("AgentManager — spawnAndWait onSpawned + foreground output file wiring (#105)", () => {
   let manager: AgentManager;
   afterEach(() => manager?.dispose());

@@ -249,6 +249,17 @@ Nested agents use their own frontmatter unchanged. In particular,
 `persist_session: true` with no `session_dir` stores each nested conversation as a
 normal Pi session using Pi's standard session-directory precedence.
 
+Every persisted subagent records its immediate parent's session file in Pi's
+header `parentSession` field when that parent has a persisted file. It also
+appends a non-model-context custom entry with discriminator
+`pi-subagents.lineage` and schema `pi-subagents.lineage.v1`. The entry identifies
+the child as a top-level or nested subagent and records child, immediate-parent,
+root-session, agent, and parent-agent identities. A parent without a persisted
+file still contributes its session ID to the custom entry; only the header path
+is absent. Pi entry `parentId` values remain links inside one session's event
+tree—they are not parent session IDs. Ordinary Pi sessions and forks do not get
+a new lineage entry from this extension.
+
 ### Tool & extension scoping
 
 `extensions:` decides **which extensions load**, `tools:` decides **which tools surface to the LLM**. They compose:
