@@ -16,6 +16,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { appendAgentLaunchContext } from "./agent-launch-context.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
@@ -606,6 +607,7 @@ export async function runAgent(
   if (agentConfig?.persistSession) {
     attachParentSession(sessionManager, options.lineage?.parentSessionFile);
   }
+  appendAgentLaunchContext(sessionManager, type, agentConfig?.launchMetadata);
 
   const sessionOpts: Parameters<typeof createAgentSession>[0] = {
     cwd: effectiveCwd,

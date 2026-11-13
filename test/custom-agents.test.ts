@@ -74,6 +74,57 @@ You are a security auditor.`);
     expect(agent.systemPrompt).toBe("You are a security auditor.");
   });
 
+  it("retains unrecognized frontmatter as opaque child launch metadata", () => {
+    writeAgent("metadata", `---
+fast: true
+openai_mode: "ultrafast"
+custom:
+  enabled: false
+---
+
+Metadata agent.`);
+
+    const agent = loadCustomAgents(tmpDir).get("metadata")!;
+    expect(agent.launchMetadata).toEqual({
+      fast: true,
+      openai_mode: "ultrafast",
+      custom: { enabled: false },
+    });
+  });
+
+  it("does not forward recognized frontmatter fields as launch metadata", () => {
+    writeAgent("recognized", `---
+description: Recognized fields
+display_name: Recognized
+tools: read
+disallowed_tools: bash
+extensions: true
+inherit_extensions: true
+exclude_extensions: none
+skills: true
+inherit_skills: true
+model: anthropic/claude-opus-4-6
+thinking: high
+max_turns: 5
+persist_session: true
+session_dir: .pi/sessions
+allow_subagents: true
+allowed_subagents: scout
+max_subagent_depth: 2
+prompt_mode: append
+inherit_context: true
+run_in_background: true
+isolated: false
+memory: project
+isolation: worktree
+enabled: true
+---
+
+Recognized agent.`);
+
+    expect(loadCustomAgents(tmpDir).get("recognized")!.launchMetadata).toBeUndefined();
+  });
+
   it("uses sensible defaults when frontmatter is empty", () => {
     writeAgent("minimal", `---
 ---

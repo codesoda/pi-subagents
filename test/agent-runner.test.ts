@@ -6,34 +6,43 @@ const {
   defaultResourceLoaderCtor,
   loaderExtensionsRef,
   getAgentDir,
+  memorySessionManager,
   sessionManagerInMemory,
   sessionManagerCreate,
   persistentSessionManager,
   settingsManagerCreate,
   settingsManagerGetSessionDir,
-} = vi.hoisted(() => ({
-  createAgentSession: vi.fn(),
-  defaultResourceLoaderCtor: vi.fn(),
-  loaderExtensionsRef: {
-    current: { extensions: [], errors: [], runtime: {} } as {
-      extensions: Array<{ path: string; tools: Map<string, unknown> }>;
-      errors: Array<{ path: string; error: string }>;
-      runtime: Record<string, unknown>;
-    },
-  },
-  getAgentDir: vi.fn(() => "/mock/agent-dir"),
-  sessionManagerInMemory: vi.fn(() => ({ kind: "memory-session-manager" })),
-  persistentSessionManager: {
-    kind: "persistent-session-manager",
-    newSession: vi.fn(),
-    getSessionId: vi.fn(() => "child-session"),
-    getSessionFile: vi.fn(() => "/sessions/child.jsonl"),
+} = vi.hoisted(() => {
+  const memorySessionManager = {
+    kind: "memory-session-manager",
     appendCustomEntry: vi.fn(),
-  },
-  sessionManagerCreate: vi.fn(),
-  settingsManagerGetSessionDir: vi.fn(() => undefined as string | undefined),
-  settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir })),
-}));
+  };
+  const settingsManagerGetSessionDir = vi.fn(() => undefined as string | undefined);
+  return {
+    createAgentSession: vi.fn(),
+    defaultResourceLoaderCtor: vi.fn(),
+    loaderExtensionsRef: {
+      current: { extensions: [], errors: [], runtime: {} } as {
+        extensions: Array<{ path: string; tools: Map<string, unknown> }>;
+        errors: Array<{ path: string; error: string }>;
+        runtime: Record<string, unknown>;
+      },
+    },
+    getAgentDir: vi.fn(() => "/mock/agent-dir"),
+    memorySessionManager,
+    sessionManagerInMemory: vi.fn(() => memorySessionManager),
+    persistentSessionManager: {
+      kind: "persistent-session-manager",
+      newSession: vi.fn(),
+      getSessionId: vi.fn(() => "child-session"),
+      getSessionFile: vi.fn(() => "/sessions/child.jsonl"),
+      appendCustomEntry: vi.fn(),
+    },
+    sessionManagerCreate: vi.fn(),
+    settingsManagerGetSessionDir,
+    settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir })),
+  };
+});
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   createAgentSession,
@@ -122,6 +131,7 @@ vi.mock("../src/nested-tools.js", () => ({
   ]),
 }));
 
+import { PI_AGENT_LAUNCH_CONTEXT_ENTRY_TYPE } from "../src/agent-launch-context.js";
 import {
   extensionCanonicalName,
   getAgentConversation,
@@ -171,6 +181,7 @@ beforeEach(() => {
   defaultResourceLoaderCtor.mockClear();
   getAgentDir.mockClear();
   sessionManagerInMemory.mockClear();
+  memorySessionManager.appendCustomEntry.mockReset();
   sessionManagerCreate.mockReset();
   sessionManagerCreate.mockReturnValue(persistentSessionManager);
   persistentSessionManager.newSession.mockReset();
@@ -208,6 +219,33 @@ describe("agent-runner final output capture", () => {
     const bindOrder = session.bindExtensions.mock.invocationCallOrder[0];
     const promptOrder = session.prompt.mock.invocationCallOrder[0];
     expect(bindOrder).toBeLessThan(promptOrder);
+    expect(memorySessionManager.appendCustomEntry).not.toHaveBeenCalled();
+  });
+
+  it("writes opaque launch metadata before child extensions bind", async () => {
+    const metadata = { fast: true, openai_mode: "ultrafast" };
+    vi.mocked(getAgentConfig).mockReturnValueOnce({
+      name: "Explore",
+      description: "Explore",
+      builtinToolNames: ["read"],
+      extensions: false,
+      skills: false,
+      systemPrompt: "You are Explore.",
+      promptMode: "replace",
+      launchMetadata: metadata,
+    } as any);
+    const { session } = createSession("METADATA");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "Use metadata", { pi });
+
+    expect(memorySessionManager.appendCustomEntry).toHaveBeenCalledWith(
+      PI_AGENT_LAUNCH_CONTEXT_ENTRY_TYPE,
+      { version: 1, agentType: "Explore", metadata },
+    );
+    expect(memorySessionManager.appendCustomEntry.mock.invocationCallOrder[0]).toBeLessThan(
+      session.bindExtensions.mock.invocationCallOrder[0],
+    );
   });
 
   it("passes effective cwd and agentDir to the loader and settings manager", async () => {
@@ -642,7 +680,10 @@ describe("agent-runner session persistence", () => {
     expect(sessionManagerInMemory).toHaveBeenCalledWith("/tmp");
     expect(sessionManagerCreate).not.toHaveBeenCalled();
     expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
-      sessionManager: { kind: "memory-session-manager" },
+      sessionManager: expect.objectContaining({
+        kind: "memory-session-manager",
+        appendCustomEntry: expect.any(Function),
+      }),
     }));
   });
 

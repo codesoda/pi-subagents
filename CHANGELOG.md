@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Agent launch metadata.** Unrecognized top-level frontmatter fields now pass
+  through to the child session as opaque launch metadata. pi-subagents writes
+  them to a versioned `pi:agent-launch-context` custom entry before child
+  extensions bind, so an extension can apply a per-agent setting such as
+  `fast: true` during `session_start`. The entry remains outside model context,
+  and pi-subagents does not interpret the values.
 - **Durable persisted-session lineage.** Persisted subagents now link their Pi
   session header to the immediate parent file and append a versioned custom
   entry that explicitly records top-level/nested classification, child,

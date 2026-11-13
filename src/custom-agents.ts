@@ -5,6 +5,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { collectAgentLaunchMetadata } from "./agent-launch-context.js";
 import { BUILTIN_TOOL_NAMES } from "./agent-types.js";
 import type { AgentConfig, MemoryScope, ThinkingLevel } from "./types.js";
 
@@ -26,6 +27,33 @@ export function loadCustomAgents(cwd: string): Map<string, AgentConfig> {
   loadFromDir(projectDir, agents, "project");  // higher priority (overwrites)
   return agents;
 }
+
+const AGENT_FRONTMATTER_FIELDS = new Set([
+  "description",
+  "display_name",
+  "tools",
+  "disallowed_tools",
+  "extensions",
+  "inherit_extensions",
+  "exclude_extensions",
+  "skills",
+  "inherit_skills",
+  "model",
+  "thinking",
+  "max_turns",
+  "persist_session",
+  "session_dir",
+  "allow_subagents",
+  "allowed_subagents",
+  "max_subagent_depth",
+  "prompt_mode",
+  "inherit_context",
+  "run_in_background",
+  "isolated",
+  "memory",
+  "isolation",
+  "enabled",
+]);
 
 /** Load agent configs from a directory into the map. */
 function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "project" | "global"): void {
@@ -77,6 +105,7 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
       isolated: fm.isolated != null ? fm.isolated === true : undefined,
       memory: parseMemory(fm.memory),
       isolation: fm.isolation === "worktree" ? "worktree" : undefined,
+      launchMetadata: collectAgentLaunchMetadata(fm, AGENT_FRONTMATTER_FIELDS),
       enabled: fm.enabled !== false,  // default true; explicitly false disables
       source,
     });

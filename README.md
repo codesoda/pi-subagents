@@ -214,6 +214,9 @@ All fields are optional — sensible defaults for everything.
 | `run_in_background` | `false` | Run fresh launches in background by default |
 | `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
+| Additional keys | — | Unrecognized top-level frontmatter fields pass through as opaque launch metadata for child-session extensions. |
+
+Child extensions can read this metadata from the `pi:agent-launch-context` custom session entry during `session_start`. Its data has `version: 1`, the `agentType`, and a `metadata` object. Custom entries do not enter the model prompt. For example, `fast: true` or `openai_mode: "ultrafast"` is forwarded unchanged; pi-subagents does not interpret those values.
 
 Frontmatter is authoritative for fresh launches. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that launch; `Agent` tool parameters only fill fields the agent config leaves unspecified. A resume keeps the existing session configuration and runs in the foreground unless that resume call explicitly passes `run_in_background: true`.
 
